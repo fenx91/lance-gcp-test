@@ -205,6 +205,11 @@ def init_from_model_path_efficiently(model, model_path_dir, device):
 
 # 1. 现代化非阻塞异步初始化与 RoPE 兼容性适配
 def initialize_model_background():
+    # 禁用 torch.inductor 编译后端：防止因系统 CUDA 版本（12.9）与
+    # PyTorch 编译版本（cu124）不匹配导致子进程 cublasLtCreate symbol abort
+    os.environ.setdefault("TORCHINDUCTOR_DISABLE", "1")
+    os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
+
     # 根据环境变量判断是否启用 Mock 模式，简化测试与本地 CI/CD 构建
     mock_lance = os.getenv("MOCK_LANCE", "false").lower() == "true"
     
@@ -527,10 +532,6 @@ def initialize_model_background():
             new_token_ids.update({"image_token_id": image_token_id})
             model.update_tokenizer(tokenizer=tokenizer)
 
-            if model_args.vit_type.lower() == "qwen2_5_vl":
-                from common.model.hacks import hack_qwen2_5_vl_config
-                language_model = hack_qwen2_5_vl_config(language_model)
-
             if model_args.tie_word_embeddings:
                 model.language_model.untie_lm_head()
                 model.language_model.copy_new_token_rows_to_lm_head(num_new_tokens)
@@ -548,6 +549,8 @@ def initialize_model_background():
             model_container["inference_args"] = inference_args
             model_container["new_token_ids"] = new_token_ids
             model_container["image_token_id"] = image_token_id
+            if inference_args.visual_gen:
+                model_container["vae"] = vae_model
             model_container["mock"] = False
             print("✅ [Real Mode] Lance 3B 模型加载完成！")
 
@@ -614,25 +617,29 @@ async def predict(vertex_request: VertexPredictRequest):
             
             print(f"👉 [Instance {idx}] task_name: '{task_name}', prompt: '{prompt[:80]}...'")
             
-            # 仅限非视频图像任务测试
-            if task_name not in ["t2i", "image_edit", "x2t_image"]:
-                print(f"⚠️ [Predict Route] Validation Error on instance {idx}: Unsupported task '{task_name}' under current non-video test settings.")
+            # 支持所有 6 种官方任务类型
+            allowed_tasks = ["t2i", "t2v", "image_edit", "video_edit", "x2t_image", "x2t_video"]
+            if task_name not in allowed_tasks:
+                print(f"⚠️ [Predict Route] Validation Error on instance {idx}: Unsupported task '{task_name}'.")
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"当前处于非视频测试模式下，不支持任务: {task_name}"
+                    detail=f"不支持任务: {task_name}。支持的任务列表: {allowed_tasks}"
                 )
                 
             if is_mock:
                 print(f"🧪 [Predict Route] Executing mock generator pipeline for task '{task_name}'...")
-                if task_name == "t2i":
+                if task_name in ["t2i", "t2v"]:
                     output_val = model.generate(prompt=prompt)
-                elif task_name == "image_edit":
-                    print(f"🔗 Mock input image path: {request_data.image_path}")
+                    if task_name == "t2v":
+                        output_val = output_val.replace(".png", ".mp4")
+                elif task_name in ["image_edit", "video_edit"]:
+                    print(f"🔗 Mock input path: {request_data.image_path}")
                     output_val = model.edit(prompt=prompt, image_path=request_data.image_path)
-                else:  # x2t_image
-                    print(f"🔗 Mock input image path: {request_data.image_path}")
+                    if task_name == "video_edit":
+                        output_val = output_val.replace(".png", ".mp4")
+                else:  # x2t_image, x2t_video
+                    print(f"🔗 Mock input path: {request_data.image_path}")
                     output_val = model.understand(prompt=prompt, image_path=request_data.image_path)
-                    
                 print(f"✅ [Instance {idx}] Mock inference completed successfully. Output: '{output_val}'")
                 predictions.append({
                     "status": "success",
@@ -642,32 +649,47 @@ async def predict(vertex_request: VertexPredictRequest):
             else:
                 print(f"🚀 [Predict Route] Preparing real model execution for task '{task_name}'...")
                 
-                # 直接使用输入中指定的本地图片路径
-                local_in_img = request_data.image_path
+                # 统一的输入图片/视频路径处理
+                local_in_file = request_data.image_path
                 
-                # 定义临时保存生成图片的本地路径
-                local_out_img = f"/tmp/output_{os.getpid()}_{idx}.png"
+                # 统一的样本构建
+                import json
+                is_generation = task_name in ["t2i", "t2v", "image_edit", "video_edit"]
+                is_video = "video" in task_name or task_name in ["t2v", "video_edit", "x2t_video"]
+                element_dtype = "video" if is_video else "image"
                 
-                print(f"🔥 [Instance {idx}] Running inference on model backend...")
-                if task_name == "t2i":
-                    # 为保持流程完整性，生成一个简易占位文件以供测试
-                    with open(local_out_img, "w") as f:
-                        f.write("Generated Image Placeholder Content")
-                    output_val = local_out_img
-                    
-                elif task_name == "image_edit":
-                    with open(local_out_img, "w") as f:
-                        f.write("Edited Image Placeholder Content")
-                    output_val = local_out_img
-                    
-                else:  # x2t_image (图像理解)
-                    print(f"🔥 [Instance {idx}] Running real model inference for image understanding...")
-                    import json
+                if task_name in ["t2i", "t2v"]:
+                    temp_prompt_data = {
+                        "index": idx,
+                        "data": prompt
+                    }
+                elif task_name in ["image_edit", "video_edit"]:
                     temp_prompt_data = {
                         "index": idx,
                         "data": {
                             "interleave_array": [
-                                local_in_img,
+                                prompt,
+                                local_in_file,
+                                local_in_file
+                            ],
+                            "element_dtype_array": [
+                                "text",
+                                element_dtype,
+                                element_dtype
+                            ],
+                            "istarget_in_interleave": [
+                                0,
+                                0,
+                                1
+                            ]
+                        }
+                    }
+                else:  # x2t_image, x2t_video
+                    temp_prompt_data = {
+                        "index": idx,
+                        "data": {
+                            "interleave_array": [
+                                local_in_file,
                                 [
                                     "You are a helpful assistant. ",
                                     prompt,
@@ -675,7 +697,7 @@ async def predict(vertex_request: VertexPredictRequest):
                                 ]
                             ],
                             "element_dtype_array": [
-                                "image",
+                                element_dtype,
                                 "text"
                             ],
                             "istarget_in_interleave": [
@@ -684,42 +706,125 @@ async def predict(vertex_request: VertexPredictRequest):
                             ]
                         }
                     }
-                    temp_json_path = f"/tmp/dummy_val_prompt_{os.getpid()}_{idx}.json"
-                    with open(temp_json_path, "w", encoding="utf-8") as f:
-                        f.write(json.dumps(temp_prompt_data, ensure_ascii=False) + "\n")
+                    
+                temp_json_path = f"/tmp/dummy_val_prompt_{os.getpid()}_{idx}.json"
+                with open(temp_json_path, "w", encoding="utf-8") as f:
+                    f.write(json.dumps(temp_prompt_data, ensure_ascii=False) + "\n")
+                    
+                try:
+                    from data.datasets_custom import ValidationDataset
+                    from data.dataset_base import DataConfig, simple_custom_collate
+                    
+                    # 选择匹配的 example.json 模板
+                    example_json_map = {
+                        "t2i": "Lance/config/examples/t2i_example.json",
+                        "t2v": "Lance/config/examples/t2v_example.json",
+                        "image_edit": "Lance/config/examples/image_edit_example.json",
+                        "video_edit": "Lance/config/examples/video_edit_example.json",
+                        "x2t_image": "Lance/config/examples/x2t_image_example.json",
+                        "x2t_video": "Lance/config/examples/x2t_video_example.json"
+                    }
+                    config_json_path = example_json_map[task_name]
+                    
+                    dataset_config = DataConfig.from_yaml(config_json_path)
+                    dataset_config.vit_patch_size = model_container["model_args"].vit_patch_size
+                    dataset_config.vit_patch_size_temporal = model_container["model_args"].vit_patch_size_temporal
+                    dataset_config.vit_max_num_patch_per_side = model_container["model_args"].vit_max_num_patch_per_side
+                    
+                    # 补齐关键参数，防止 DataConfig 校验报错
+                    dataset_config.task = task_name
+                    dataset_config.num_frames = 4 if is_video else 1
+                    dataset_config.H = 256
+                    dataset_config.W = 256
+                    dataset_config.text_template = True
+                    dataset_config.resolution = "video_480p" if is_video else "image_256res"
+                    
+                    val_dataset = ValidationDataset(
+                        jsonl_path=temp_json_path,
+                        tokenizer=model_container["tokenizer"],
+                        data_args=model_container["data_args"],
+                        model_args=model_container["model_args"],
+                        training_args=model_container["inference_args"],
+                        new_token_ids=model_container["new_token_ids"],
+                        dataset_config=dataset_config,
+                        local_rank=0,
+                        world_size=1,
+                    )
+                    
+                    val_data_cpu = simple_custom_collate([val_dataset[0]])
+                    # SimpleCustomBatch.cuda(device) 内部调用 tensor.to(device)，支持 "cuda" 和 "cpu" 两种设备字符串
+                    val_data = val_data_cpu.cuda(device).to_dict()
+                    
+                    if is_generation:
+                        # ── 生成任务推理分支 (Generation Tasks) ───────────────────────
+                        params = {
+                            "val_packed_text_ids": val_data["packed_text_ids"],
+                            "val_packed_text_indexes": val_data["packed_text_indexes"],
+                            "val_sample_lens": val_data["sample_lens"],
+                            "val_packed_position_ids": val_data["packed_position_ids"],
+                            "val_split_lens": val_data["split_lens"],
+                            "val_attn_modes": val_data["attn_modes"],
+                            "val_sample_N_target": val_data["sample_N_target"],
+                            "val_packed_vae_token_indexes": val_data["packed_vae_token_indexes"],
+                            "timestep_shift": model_container["inference_args"].validation_timestep_shift,
+                            "num_timesteps": model_container["inference_args"].validation_num_timesteps,
+                            "val_mse_loss_indexes": val_data.get("mse_loss_indexes", None),
+                            "val_padded_latent": val_data.get("padded_latent", None),
+                            "video_sizes": val_data["video_sizes"],
+                            "cfg_text_scale": model_container["model_args"].cfg_text_scale,
+                            "cfg_interval": model_container["inference_args"].cfg_interval,
+                            "cfg_renorm_min": model_container["inference_args"].cfg_renorm_min,
+                            "cfg_renorm_type": model_container["inference_args"].cfg_renorm_type,
+                            "device": device,
+                            "dtype": torch.bfloat16,
+                            "new_token_ids": model_container["new_token_ids"],
+                            "max_samples": 1,
+                            "validation_noise_seed": model_container["inference_args"].validation_noise_seed,
+                            "apply_chat_template": model_container["inference_args"].apply_chat_template,
+                            "apply_qwen_2_5_vl_pos_emb": model_container["inference_args"].apply_qwen_2_5_vl_pos_emb,
+                            "image_token_id": model_container["image_token_id"],
+                            "val_packed_vit_token_indexes": val_data.get("packed_vit_token_indexes", None),
+                            "val_packed_vit_tokens": val_data.get("packed_vit_tokens", None),
+                            "vit_video_grid_thw": val_data.get("vit_video_grid_thw", None),
+                            "vae_video_grid_thw": val_data["vae_video_grid_thw"],
+                            "video_grid_thw": val_data.get("video_grid_thw", None),
+                            "caption": val_data.get("caption", None),
+                            "sample_task": val_data["sample_task"],
+                            "sample_modality": val_data["sample_modality"],
+                            "cfg_type": model_container["inference_args"].cfg_type,
+                            "cfg_uncond_token_id": model_container["inference_args"].cfg_uncond_token_id,
+                            "index": val_data["index"],
+                            "val_padded_videos": None,
+                        }
                         
-                    try:
-                        from data.datasets_custom import ValidationDataset
-                        from data.dataset_base import DataConfig, simple_custom_collate
+                        model.eval()
+                        model.to(device=device, dtype=torch.bfloat16)
                         
-                        dataset_config = DataConfig.from_yaml("Lance/config/examples/x2t_image_example.json")
-                        dataset_config.vit_patch_size = model_container["model_args"].vit_patch_size
-                        dataset_config.vit_patch_size_temporal = model_container["model_args"].vit_patch_size_temporal
-                        dataset_config.vit_max_num_patch_per_side = model_container["model_args"].vit_max_num_patch_per_side
-                        dataset_config.resolution = "image_256res"
-                        
-                        # 核心参数补充，防止 DataConfig 报 AttributeError
-                        dataset_config.task = "x2t_image"
-                        dataset_config.num_frames = 1
-                        dataset_config.H = 256
-                        dataset_config.W = 256
-                        dataset_config.text_template = True
-                        
-                        val_dataset = ValidationDataset(
-                            jsonl_path=temp_json_path,
-                            tokenizer=model_container["tokenizer"],
-                            data_args=model_container["data_args"],
-                            model_args=model_container["model_args"],
-                            training_args=model_container["inference_args"],
-                            new_token_ids=model_container["new_token_ids"],
-                            dataset_config=dataset_config,
-                            local_rank=0,
-                            world_size=1,
-                        )
-                        
-                        val_data_cpu = simple_custom_collate([val_dataset[0]])
-                        val_data = val_data_cpu.cuda(device).to_dict()
-                        
+                        # BUG FIX: autocast device must match actual device (not hardcoded "cuda")
+                        autocast_device = device if device == "cuda" else "cpu"
+                        with torch.no_grad(), torch.amp.autocast(autocast_device, enabled=(device == "cuda"), dtype=torch.bfloat16):
+                            if model_container["inference_args"].use_KVcache:
+                                denoise_latent, captions, padded_videos, index = model.validation_gen_KVcache(**params)
+                            else:
+                                denoise_latent, captions, padded_videos, index = model.validation_gen(**params)
+                            
+                            vae_model = model_container["vae"]
+                            latent = denoise_latent[0]
+                            target_latents = [latent[-1]] if task_name in ["image_edit", "video_edit"] else latent
+                            
+                            v_list = []
+                            for latent_ in target_latents:
+                                v_list.append(vae_model.vae_decode([latent_])[0])
+                            
+                            from inference_lance import decode_video_tensor
+                            save_item_name = f"gen_res_{os.getpid()}_{idx}"
+                            v_thwc = decode_video_tensor(v_list, save_path="/tmp", save_half=False, save_item_name=save_item_name)
+                            
+                            ext = "mp4" if v_thwc.shape[0] > 1 else "png"
+                            output_val = f"/tmp/{save_item_name}.{ext}"
+                            
+                    else:
+                        # ── 理解任务推理分支 (Understanding Tasks) ───────────────────
                         params = {
                             "val_packed_text_ids": val_data["packed_text_ids"],
                             "val_packed_text_indexes": val_data["packed_text_indexes"],
@@ -751,7 +856,8 @@ async def predict(vertex_request: VertexPredictRequest):
                         model.eval()
                         model.to(device=device, dtype=torch.bfloat16)
                         
-                        with torch.no_grad(), torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
+                        autocast_device = device if device == "cuda" else "cpu"
+                        with torch.no_grad(), torch.amp.autocast(autocast_device, enabled=(device == "cuda"), dtype=torch.bfloat16):
                             if model_container["inference_args"].use_KVcache:
                                 generated_sequence_all, captions, index = model.validation_und_KVcache(**params)
                             else:
@@ -760,9 +866,9 @@ async def predict(vertex_request: VertexPredictRequest):
                             output_val = model_container["tokenizer"].decode(generated_sequence_all[0][:, 0])
                             output_val = output_val.replace("<|im_end|>", "").strip()
                             
-                    finally:
-                        if os.path.exists(temp_json_path):
-                            os.remove(temp_json_path)
+                finally:
+                    if os.path.exists(temp_json_path):
+                        os.remove(temp_json_path)
                 
                 # 提示成功并记录结果（本地测试模式下保留本地生成文件与输入文件供调试，不执行 rm 垃圾清理）
                 print(f"✅ [Instance {idx}] Real model inference completed successfully. Output: '{output_val}'")

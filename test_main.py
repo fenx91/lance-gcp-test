@@ -74,19 +74,62 @@ def test_predict_endpoint_x2t_image(client):
     assert data["predictions"][0]["task"] == "x2t_image"
     assert "yarn" in data["predictions"][0]["output"]  # Mock 返回中包含的代码匹配
 
-def test_predict_endpoint_unsupported_task(client):
-    # 测试非视频测试模式下，不支持的视频任务 (t2v)
+def test_predict_endpoint_t2v(client):
+    # 测试文本生成视频 (t2v) 任务
     payload = {
         "instances": [
             {
                 "task_name": "t2v",
-                "prompt": "A running horse"
+                "prompt": "A beautiful cinematic shot of waves crashing on the shore"
             }
         ]
     }
     response = client.post("/v1/predict", json=payload)
-    assert response.status_code == 400
-    assert "不支持任务" in response.json()["detail"]
+    assert response.status_code == 200
+    data = response.json()
+    assert "predictions" in data
+    assert len(data["predictions"]) == 1
+    assert data["predictions"][0]["task"] == "t2v"
+    assert data["predictions"][0]["output"].endswith(".mp4")
+
+def test_predict_endpoint_video_edit(client):
+    # 测试视频编辑 (video_edit) 任务
+    payload = {
+        "instances": [
+            {
+                "task_name": "video_edit",
+                "prompt": "make the weather sunny",
+                "image_path": "gs://lance-weights-bucket-1/inputs/video.mp4"
+            }
+        ]
+    }
+    response = client.post("/v1/predict", json=payload)
+    assert response.status_code == 200
+    data = response.json()
+    assert "predictions" in data
+    assert len(data["predictions"]) == 1
+    assert data["predictions"][0]["task"] == "video_edit"
+    assert data["predictions"][0]["output"].endswith(".mp4")
+
+def test_predict_endpoint_x2t_video(client):
+    # 测试视频理解 (x2t_video) 任务
+    payload = {
+        "instances": [
+            {
+                "task_name": "x2t_video",
+                "prompt": "Describe what happens in this video",
+                "image_path": "gs://lance-weights-bucket-1/inputs/video.mp4"
+            }
+        ]
+    }
+    response = client.post("/v1/predict", json=payload)
+    assert response.status_code == 200
+    data = response.json()
+    assert "predictions" in data
+    assert len(data["predictions"]) == 1
+    assert data["predictions"][0]["task"] == "x2t_video"
+    assert "yarn" in data["predictions"][0]["output"]  # Mock 返回中包含的代码匹配
+
 
 def test_predict_endpoint_empty_instances(client):
     # 测试 instances 为空的情况
