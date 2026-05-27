@@ -6,6 +6,12 @@ from datetime import datetime
 import os
 import sys
 import threading
+import torch
+
+# Monkeypatch wrap_triton for torch < 2.6 (e.g. 2.5.1) to avoid flash_attn AttributeError
+if not hasattr(torch.library, "wrap_triton"):
+    torch.library.wrap_triton = lambda fn: fn
+
 
 
 # ── Pydantic 请求/响应数据模型 ──────────────────────────────────────────────────
@@ -508,7 +514,8 @@ def initialize_model_background():
 
             # 9. 载入主模型预训练参数权重（采用极智流式载入，彻底防御 OOM 崩溃）
             print("📥 正在从本地模型目录流式载入大模型核心权重...")
-            init_from_model_path_efficiently(model, model_args.model_path, device)
+            init_from_model_path_if_needed(model, model_args)
+
 
             # 10. 大小校准与特征挂载
             if num_new_tokens > 0:
@@ -657,16 +664,29 @@ async def predict(vertex_request: VertexPredictRequest):
                     print(f"🔥 [Instance {idx}] Running real model inference for image understanding...")
                     import json
                     temp_prompt_data = {
-                        f"inst_{idx}": {
-                            "system_prompt": "You are a helpful assistant.",
-                            "user_prompt": prompt,
-                            "gt": "",
-                            "image_path": local_in_img
+                        "index": idx,
+                        "data": {
+                            "interleave_array": [
+                                local_in_img,
+                                [
+                                    "You are a helpful assistant. ",
+                                    prompt,
+                                    ""
+                                ]
+                            ],
+                            "element_dtype_array": [
+                                "image",
+                                "text"
+                            ],
+                            "istarget_in_interleave": [
+                                0,
+                                1
+                            ]
                         }
                     }
                     temp_json_path = f"/tmp/dummy_val_prompt_{os.getpid()}_{idx}.json"
                     with open(temp_json_path, "w", encoding="utf-8") as f:
-                        json.dump(temp_prompt_data, f, ensure_ascii=False)
+                        f.write(json.dumps(temp_prompt_data, ensure_ascii=False) + "\n")
                         
                     try:
                         from data.datasets_custom import ValidationDataset

@@ -56,3 +56,46 @@ def test_real_model_loading_and_gpu_placement():
         assert next(model.vit_model.parameters()).dtype == torch.bfloat16, "❌ Vision Transformer (ViT) 精度不是 bfloat16"
     
     print("🎉 [Test Real Load] 真实模型成功载入 GPU 且结构状态校验完全通过！")
+
+
+def test_real_image_understanding():
+    """
+    直接调用 main.py 中的 predict 接口函数，对保时捷联名跑鞋图片进行图像理解推理测试。
+    """
+    print("\n🚀 [Test Real Load] 开始测试直接调用 predict 接口的图像理解推理...")
+    
+    # 确保模型已经加载
+    if "model" not in model_container:
+        initialize_model_background()
+        
+    assert "model" in model_container
+    
+    import asyncio
+    from main import predict, VertexPredictRequest
+    
+    # 使用提供的图片做测试用例
+    image_path = os.path.abspath("Porsche-Puma-964-scaled.jpeg")
+    assert os.path.exists(image_path), f"❌ 测试图片不存在: {image_path}"
+    
+    # 构造请求载荷
+    vertex_request = VertexPredictRequest(
+        instances=[
+            {
+                "task_name": "x2t_image",
+                "prompt": "Describe this image in detail.",
+                "image_path": image_path
+            }
+        ]
+    )
+    
+    # 异步执行 predict 接口函数
+    response = asyncio.run(predict(vertex_request))
+    
+    print(f"\n🎉 [Test Real Load] predict 接口返回结果：\n>>> {response}\n")
+    
+    assert "predictions" in response, "❌ 接口返回格式错误，缺少 'predictions' 键"
+    predictions = response["predictions"]
+    assert len(predictions) > 0, "❌ predictions 结果列表为空"
+    assert predictions[0]["status"] == "success", f"❌ 推理执行失败: {predictions[0]}"
+    output_val = predictions[0]["output"]
+    assert len(output_val) > 0, "❌ 真实模型推理出的输出文本不能为空"
