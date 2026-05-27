@@ -1,0 +1,28 @@
+# Python caches and byte code
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Virtual environments
+venv/
+env/
+.env/
+
+# Model weights and downloaded assets (Very large files!)
+downloads/
+*.safetensors
+*.pth
+*.bin
+*.pt
+
+# Cloned/external dependencies
+Lance/
+
+# Local IDE and tool directories
+.antigravitycli/
+.vscode/
+.idea/
+
+# Log files
+*.log
