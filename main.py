@@ -514,10 +514,33 @@ def initialize_model_background():
             if num_new_tokens > 0:
                 model.language_model.resize_token_embeddings(len(tokenizer))
                 model.config.llm_config.vocab_size = len(tokenizer)
+                model.language_model.config.vocab_size = len(tokenizer)
+
+            image_token_id = model.language_model.config.video_token_id
+            new_token_ids.update({"image_token_id": image_token_id})
+            model.update_tokenizer(tokenizer=tokenizer)
+
+            if model_args.vit_type.lower() == "qwen2_5_vl":
+                from common.model.hacks import hack_qwen2_5_vl_config
+                language_model = hack_qwen2_5_vl_config(language_model)
+
+            if model_args.tie_word_embeddings:
+                model.language_model.untie_lm_head()
+                model.language_model.copy_new_token_rows_to_lm_head(num_new_tokens)
+                model_args.tie_word_embeddings = False
+                model.config.llm_config.tie_word_embeddings = False
+
+            model = model.to(device=device, dtype=torch.bfloat16)
+            model.eval()
 
             model_container["model"] = model
             model_container["tokenizer"] = tokenizer
             model_container["device"] = device
+            model_container["model_args"] = model_args
+            model_container["data_args"] = data_args
+            model_container["inference_args"] = inference_args
+            model_container["new_token_ids"] = new_token_ids
+            model_container["image_token_id"] = image_token_id
             model_container["mock"] = False
             print("✅ [Real Mode] Lance 3B 模型加载完成！")
 
@@ -611,56 +634,117 @@ async def predict(vertex_request: VertexPredictRequest):
                 })
             else:
                 print(f"🚀 [Predict Route] Preparing real model execution for task '{task_name}'...")
-                local_in_img = None
-                if request_data.image_path:
-                    local_in_img = f"/tmp/input_{os.getpid()}_{idx}.png"
-                    print(f"📦 [Instance {idx}] Downloading input image from GCS: '{request_data.image_path}' -> '{local_in_img}'")
-                    download_gcs_to_local(request_data.image_path, local_in_img)
                 
-                # 定义临时保存生成图片的路径
+                # 直接使用输入中指定的本地图片路径
+                local_in_img = request_data.image_path
+                
+                # 定义临时保存生成图片的本地路径
                 local_out_img = f"/tmp/output_{os.getpid()}_{idx}.png"
-                gcs_output_bucket = "lance-weights-bucket-1"
                 
                 print(f"🔥 [Instance {idx}] Running inference on model backend...")
                 if task_name == "t2i":
-                    # 【核心真实图像生成占位】
-                    # image_tensor = model.generate(prompt=prompt)
-                    # save_image(image_tensor, local_out_img)
-                    
-                    # 为保持流程完整性，生成一个简易占位文件以供上传
+                    # 为保持流程完整性，生成一个简易占位文件以供测试
                     with open(local_out_img, "w") as f:
                         f.write("Generated Image Placeholder Content")
-                        
-                    gcs_dest_blob = f"outputs/t2i_{os.getpid()}_{idx}.png"
-                    print(f"📤 [Instance {idx}] Uploading output placeholder file to GCS: '{local_out_img}' -> 'gs://{gcs_output_bucket}/{gcs_dest_blob}'")
-                    output_val = upload_local_to_gcs(local_out_img, gcs_output_bucket, gcs_dest_blob)
+                    output_val = local_out_img
                     
                 elif task_name == "image_edit":
-                    # 【核心真实图像编辑占位】
-                    # image_tensor = model.edit(prompt=prompt, image_path=local_in_img)
-                    # save_image(image_tensor, local_out_img)
-                    
                     with open(local_out_img, "w") as f:
                         f.write("Edited Image Placeholder Content")
-                        
-                    gcs_dest_blob = f"outputs/image_edit_{os.getpid()}_{idx}.png"
-                    print(f"📤 [Instance {idx}] Uploading edited placeholder file to GCS: '{local_out_img}' -> 'gs://{gcs_output_bucket}/{gcs_dest_blob}'")
-                    output_val = upload_local_to_gcs(local_out_img, gcs_output_bucket, gcs_dest_blob)
+                    output_val = local_out_img
                     
                 else:  # x2t_image (图像理解)
-                    # 【核心真实图像理解占位】
-                    # output_val = model.understand(prompt=prompt, image_path=local_in_img)
-                    output_val = "这是经过真实 Lance 3B 模型在 GPU 上推理得出的图像理解文本"
-                    print(f"ℹ️ [Instance {idx}] Generated text output directly from model.")
+                    print(f"🔥 [Instance {idx}] Running real model inference for image understanding...")
+                    import json
+                    temp_prompt_data = {
+                        f"inst_{idx}": {
+                            "system_prompt": "You are a helpful assistant.",
+                            "user_prompt": prompt,
+                            "gt": "",
+                            "image_path": local_in_img
+                        }
+                    }
+                    temp_json_path = f"/tmp/dummy_val_prompt_{os.getpid()}_{idx}.json"
+                    with open(temp_json_path, "w", encoding="utf-8") as f:
+                        json.dump(temp_prompt_data, f, ensure_ascii=False)
+                        
+                    try:
+                        from data.datasets_custom import ValidationDataset
+                        from data.dataset_base import DataConfig, simple_custom_collate
+                        
+                        dataset_config = DataConfig.from_yaml("Lance/config/examples/x2t_image_example.json")
+                        dataset_config.vit_patch_size = model_container["model_args"].vit_patch_size
+                        dataset_config.vit_patch_size_temporal = model_container["model_args"].vit_patch_size_temporal
+                        dataset_config.vit_max_num_patch_per_side = model_container["model_args"].vit_max_num_patch_per_side
+                        dataset_config.resolution = "image_256res"
+                        
+                        # 核心参数补充，防止 DataConfig 报 AttributeError
+                        dataset_config.task = "x2t_image"
+                        dataset_config.num_frames = 1
+                        dataset_config.H = 256
+                        dataset_config.W = 256
+                        dataset_config.text_template = True
+                        
+                        val_dataset = ValidationDataset(
+                            jsonl_path=temp_json_path,
+                            tokenizer=model_container["tokenizer"],
+                            data_args=model_container["data_args"],
+                            model_args=model_container["model_args"],
+                            training_args=model_container["inference_args"],
+                            new_token_ids=model_container["new_token_ids"],
+                            dataset_config=dataset_config,
+                            local_rank=0,
+                            world_size=1,
+                        )
+                        
+                        val_data_cpu = simple_custom_collate([val_dataset[0]])
+                        val_data = val_data_cpu.cuda(device).to_dict()
+                        
+                        params = {
+                            "val_packed_text_ids": val_data["packed_text_ids"],
+                            "val_packed_text_indexes": val_data["packed_text_indexes"],
+                            "val_packed_position_ids": val_data["packed_position_ids"],
+                            "val_ce_loss_indexes": val_data["ce_loss_indexes"],
+                            "val_sample_N_target": val_data["sample_N_target"],
+                            "val_split_lens": val_data["split_lens"],
+                            "val_attn_modes": val_data["attn_modes"],
+                            "val_sample_lens": val_data["sample_lens"],
+                            "val_sample_type": val_data["sample_type"],
+                            "val_packed_vit_tokens": val_data["packed_vit_tokens"],
+                            "val_vit_video_grid_thw": val_data["vit_video_grid_thw"],
+                            "max_samples": 1,
+                            "max_length": 256,
+                            "device": device,
+                            "dtype": torch.bfloat16,
+                            "new_token_ids": model_container["new_token_ids"],
+                            "pad_token_id": model_container["tokenizer"].pad_token_id,
+                            "vocab_size": len(model_container["tokenizer"]),
+                            "caption": val_data.get("caption_cn", None),
+                            "tokenizer": model_container["tokenizer"],
+                            "apply_chat_template": model_container["inference_args"].apply_chat_template,
+                            "apply_qwen_2_5_vl_pos_emb": model_container["inference_args"].apply_qwen_2_5_vl_pos_emb,
+                            "do_sample": False,
+                            "image_token_id": model_container["image_token_id"],
+                            "index": val_data["index"],
+                        }
+                        
+                        model.eval()
+                        model.to(device=device, dtype=torch.bfloat16)
+                        
+                        with torch.no_grad(), torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
+                            if model_container["inference_args"].use_KVcache:
+                                generated_sequence_all, captions, index = model.validation_und_KVcache(**params)
+                            else:
+                                generated_sequence_all, captions, index = model.validation_video_to_text(**params)
+                                
+                            output_val = model_container["tokenizer"].decode(generated_sequence_all[0][:, 0])
+                            output_val = output_val.replace("<|im_end|>", "").strip()
+                            
+                    finally:
+                        if os.path.exists(temp_json_path):
+                            os.remove(temp_json_path)
                 
-                # 垃圾清理
-                if local_in_img and os.path.exists(local_in_img):
-                    print(f"🧹 Cleaning up local input image: '{local_in_img}'")
-                    os.remove(local_in_img)
-                if os.path.exists(local_out_img):
-                    print(f"🧹 Cleaning up local output image: '{local_out_img}'")
-                    os.remove(local_out_img)
-                    
+                # 提示成功并记录结果（本地测试模式下保留本地生成文件与输入文件供调试，不执行 rm 垃圾清理）
                 print(f"✅ [Instance {idx}] Real model inference completed successfully. Output: '{output_val}'")
                 predictions.append({
                     "status": "success",
